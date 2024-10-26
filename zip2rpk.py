@@ -10,6 +10,10 @@ import zipfile
 import zlib
 
 
+class BadRPKError(Exception):
+    pass
+
+
 class BadDataError(Exception):
     pass
 
@@ -108,7 +112,7 @@ class Cartridge:
     def get_dataarea(self, name, size=None):
         if name.endswith("_socket"):
             name = name[:-7]
-        if name not in ('rom', 'grom', 'ram', 'nvram'):
+        if name not in ('rom', 'rom2', 'grom', 'ram', 'nvram'):
             raise ValueError("Unknown dataarea %s" % (name,))
         if name not in self.dataareas:
             if size is None:
@@ -154,8 +158,11 @@ class CartXmlContentHandler(xml.sax.handler.ContentHandler):
                 else:
                     self.software.set_pcb(attrs["value"])
             elif name == "dataarea":
+                name = attrs["name"]
+                if name.startswith('rom2'):
+                    raise ValueError("Unknown dataarea %s" % (name,))
                 self.dataarea = self.software.get_dataarea(
-                    attrs["name"], int(attrs["size"], 0))
+                    name, int(attrs["size"], 0))
             elif name == "rom":
                 if self.dataarea is None:
                     raise SyntaxError("rom outside dataarea")
@@ -179,6 +186,77 @@ class CartXmlContentHandler(xml.sax.handler.ContentHandler):
                 self.software.set_metadata(name, self.content)
             elif name == "dataarea":
                 self.dataarea = None
+        self.content = None
+
+    def characters(self, content):
+        if self.content is not None:
+            self.content += content
+
+
+class LayoutXmlContentHandler(xml.sax.handler.ContentHandler):
+
+    def __init__(self, cartridge, rpk):
+        xml.sax.handler.ContentHandler.__init__(self)
+        self.cartridge = cartridge
+        self.rpk = rpk
+        self.resources = None
+
+    def startElement(self, name, attrs):
+        if name == 'romset':
+            if "listname" in attrs:
+                self.cartridge.name = attrs["listname"]
+        elif name == 'resources':
+            self.resources = {}
+        elif name == 'rom':
+            filename = attrs["file"]
+            data = None
+            try:
+                data = self.rpk.read(filename)
+            except KeyError:
+                for fn in self.rpk.namelist():
+                    if fn.lower() == filename.lower():
+                        print("WARNING: case mismatch - layout.xml has %s "
+                              "but actual zip entry is %s" % (filename, fn),
+                              file=sys.stderr)
+                        data = self.rpk.read(fn)
+                        break
+                if data is None:
+                    raise BadRPKError("%s is missing in zip" % (filename,))
+            self.resources[attrs["id"]] = (filename, data)
+        elif name == 'ram':
+            filename = attrs["file"] if "file" in attrs else None
+            self.resources[attrs["id"]] = (
+                filename, bytes(int(attrs["length"], 0)))
+        elif name == 'configuration':
+            pass
+        elif name == 'pcb':
+            self.cartridge.set_pcb(attrs["type"])
+        elif name == 'socket':
+            filename, data = self.resources[attrs["uses"]]
+            if attrs["id"] == "grom_socket" and len(data) % 0x2000 != 0:
+                data += bytes(0x2000-(len(data) % 0x2000))
+            da = self.cartridge.get_dataarea(attrs["id"], len(data))
+            if len(da.roms):
+                raise BadRPKError("socket %s defined twice" % (attrs["id"],))
+            da.data = data
+            da.add_rom(filename, len(data), "%08x" % zlib.crc32(data),
+                       hashlib.sha1(data).digest().hex(), 0)
+        else:
+            raise SyntaxError("Unknown element %s" % (name,))
+
+
+class MetaInfXmlContentHandler(xml.sax.handler.ContentHandler):
+
+    def startDocument(self):
+        self.metadata = {}
+        self.content = None
+
+    def startElement(self, name, attrs):
+        self.content = ""
+
+    def endElement(self, name):
+        if name in ('name', 'year', 'dist', 'number'):
+            self.metadata[name] = self.content
         self.content = None
 
     def characters(self, content):
@@ -294,23 +372,67 @@ def write_rpk(rpk, cart):
     rpk.writestr('softlist.xml', softlist)
 
 
+def validate_rpk(rpk, sw):
+    pcb = sw.pcb
+    if pcb.startswith('paged'):
+        pcb = 'paged'
+    if rpk.pcb != pcb:
+        raise BadRPKError("pcb type is %s, should be %s" % (rpk.pcb, pcb))
+    areac = rpk.get_dataarea('rom')
+    aread = rpk.get_dataarea('rom2')
+    areag = rpk.get_dataarea('grom')
+    if sw.pcb == 'paged12k':
+        if (areac is None or aread is None or
+            areac.size != 0x2000 or aread.size != 0x2000 or
+                areac.data[:0x1000] != aread.data[:0x1000]):
+            raise BadRPKError("Bad ROM layout for pcb type paged12k")
+        aread.data = areac.data[0x1000:0x2000] + aread.data[0x1000:0x2000]
+    if pcb == 'paged':
+        if areac is None or aread is None or areac.size != 0x2000:
+            raise BadRPKError("Bad ROM layout for paged pcb")
+        areac.size += aread.size
+        areac.data += aread.data
+        areac.roms.extend([(name, size, crc, sha1, offset+0x2000) for
+                           (name, size, crc, sha1, offset) in aread.roms])
+        aread = None
+    if aread is not None:
+        raise BadRPKError("bad use of rom2")
+    for area, areaname in [(areac, 'rom'), (areag, 'grom')]:
+        swarea = sw.get_dataarea(areaname)
+        if swarea is not None:
+            if area is None:
+                raise BadRPKError("missing '%s' socket", (areaname,))
+            for name, size, crc, sha1, offset in swarea.roms:
+                if offset + size > len(area.data):
+                    raise BadRPKError("socket '%s' does not have enough data"
+                                      % (areaname,))
+                check_data("%s @ 0x%04x" % (areaname, offset),
+                           area.data[offset:offset+size], size, crc, sha1)
+
+
 def main():
     parser = argparse.ArgumentParser("zip2rpk",
                                      description="Use ti99_cart.xml to "
-                                     "create RPK files")
+                                     "create or validate RPK files")
     parser.add_argument('xml', help="Full path to ti99_cart.xml",
                         metavar='ti99_cart.xml', type=argparse.FileType('rb'))
     parser.add_argument('zip', help="zip file to load", nargs='?',
                         type=argparse.FileType('rb'))
     parser.add_argument('rpk', help="rpk file to create", nargs='?', type=str)
+    parser.add_argument('--name', '-n', help="name in softwarelist",
+                        metavar="list_name", type=str)
+    parser.add_argument('--check', '-c', help="rpk file to check",
+                        metavar="check_rpk", type=argparse.FileType('rb'))
 
     args = parser.parse_args()
     content_handler = CartXmlContentHandler()
     xml.sax.parse(args.xml, content_handler)
     softwarelist = content_handler.softwarelist
     cartridge = None
+    cartname = args.name
     if args.zip is not None:
-        cartname = pathlib.Path(args.zip.name).stem
+        if cartname is None:
+            cartname = pathlib.Path(args.zip.name).stem
         if cartname not in softwarelist:
             raise KeyError("Unknown cartridge %s" % (cartname,))
         cartridge = softwarelist[cartname]
@@ -324,6 +446,44 @@ def main():
                              compresslevel=9) as rpk:
             write_rpk(rpk, cartridge)
             print("%s written ok to %s" % (cartridge.name, args.rpk))
+    if args.check is not None:
+        try:
+            rpk_cartridge = Cartridge(None)
+            with zipfile.ZipFile(args.check) as rpk:
+                content_handler = LayoutXmlContentHandler(rpk_cartridge, rpk)
+                with rpk.open('layout.xml') as layout:
+                    xml.sax.parse(layout, content_handler)
+                if cartname is None:
+                    if rpk_cartridge.name is not None:
+                        cartname = rpk_cartridge.name
+                        print("Using cartname %s from rpk" % (cartname,))
+                    else:
+                        print("Trying to guess cartname from meta-inf.xml...")
+                        content_handler = MetaInfXmlContentHandler()
+                        with rpk.open('meta-inf.xml') as meta_inf:
+                            xml.sax.parse(meta_inf, content_handler)
+                        if 'number' in content_handler.metadata:
+                            serial = content_handler.metadata['number']
+                            matches = [sw for sw in softwarelist.values() if
+                                       'serial' in sw.metadata and
+                                       serial == sw.metadata['serial']]
+                            if len(matches) == 1:
+                                cartname = matches[0].name
+                                print("Using cartname %s based on serial %s" %
+                                      (cartname, serial))
+                        if cartname is None:
+                            raise RuntimeError(
+                                "Unable to guess cartname, please use -n")
+            if cartridge is None:
+                if cartname in softwarelist:
+                    cartridge = softwarelist[cartname]
+                else:
+                    raise KeyError("Unknown cartridge %s, please use -n" %
+                                   (cartname,))
+            validate_rpk(rpk_cartridge, cartridge)
+        except (BadRPKError, BadDataError) as e:
+            sys.exit("Bad RPK: %s" % (e,))
+        print("rpk %s is valid for %s" % (args.check.name, cartname))
 
 
 if __name__ == '__main__':
