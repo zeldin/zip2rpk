@@ -423,8 +423,12 @@ def main():
                         metavar="list_name", type=str)
     parser.add_argument('--check', '-c', help="rpk file to check",
                         metavar="check_rpk", type=argparse.FileType('rb'))
+    parser.add_argument('--debug', '-d', help="enable python tracebacks",
+                        action='store_true')
 
     args = parser.parse_args()
+    if not args.debug:
+        sys.tracebacklimit = 0
     content_handler = CartXmlContentHandler()
     xml.sax.parse(args.xml, content_handler)
     softwarelist = content_handler.softwarelist
