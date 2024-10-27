@@ -269,6 +269,10 @@ def write_rpk(rpk, cart):
             ''.join(cart.metadata["serial"].lower().split()))
     areac = cart.get_dataarea('rom')
     areag = cart.get_dataarea('grom')
+    arear = cart.get_dataarea('ram')
+    arean = cart.get_dataarea('nvram')
+    if arear is not None and arean is not None:
+        raise ValueError("Can't have both ram and nvram!?")
     datac = None
     datad = None
     if areac is not None:
@@ -317,6 +321,13 @@ def write_rpk(rpk, cart):
         if len(areac.roms) == 2:
             ET.SubElement(resources, 'rom', id="rom2image", file=base+'d.bin')
             ET.SubElement(pcb, 'socket', id="rom2_socket", uses="rom2image")
+    if arear is not None:
+        ET.SubElement(resources, 'ram', id='ram', length="%d" % (arear.size,))
+        ET.SubElement(pcb, 'socket', id="ram_socket", uses="ram")
+    if arean is not None:
+        ET.SubElement(resources, 'ram', id='bufferedRam', type='persistent',
+                      file=cart.name+'.nv', length="%d" % (arean.size,))
+        ET.SubElement(pcb, 'socket', id="ram_socket", uses="bufferedRam")
     ET.indent(romset, '   ')
     layout = ET.tostring(romset, encoding='utf-8', xml_declaration=True)+b'\n'
     rpk.writestr('layout.xml', layout)
@@ -360,6 +371,12 @@ def write_rpk(rpk, cart):
                       crc="%08x" % (zlib.crc32(datad),),
                       sha1=hashlib.sha1(datad).digest().hex(),
                       offset="0x0000")
+    if arear is not None:
+        ET.SubElement(
+            part, 'dataarea', name="ram_socket", size="%d" % (arear.size,))
+    if arean is not None:
+        ET.SubElement(
+            part, 'dataarea', name="nvram_socket", size="%d" % (arean.size,))
     ET.indent(software, '\t')
     sw = ET.Element(None)
     sw.insert(0, software)
