@@ -26,3 +26,6 @@ Test if an RPK is valid:
 ```
 zip2rpk.py ti99_cart.xml -c ms_multiplan.rpk 
 ```
+
+The `ti99_cart.xml` file can be found in MAME distributions,
+or [on GitHub](https://raw.githubusercontent.com/mamedev/mame/refs/heads/master/hash/ti99_cart.xml).
