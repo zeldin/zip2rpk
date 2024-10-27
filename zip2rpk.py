@@ -401,7 +401,7 @@ def validate_rpk(rpk, sw):
         swarea = sw.get_dataarea(areaname)
         if swarea is not None:
             if area is None:
-                raise BadRPKError("missing '%s' socket", (areaname,))
+                raise BadRPKError("missing '%s' socket" % (areaname,))
             for name, size, crc, sha1, offset in swarea.roms:
                 if offset + size > len(area.data):
                     raise BadRPKError("socket '%s' does not have enough data"
